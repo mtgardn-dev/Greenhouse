@@ -62,6 +62,8 @@ from PySide6.QtWidgets import (
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
+from core.daily_metrics import extract_daily_stat_groups, prepare_daily_dataframe
+
 
 APP_ORG = "GardnerGreenhouse"
 APP_NAME = "GreenhouseLogViewer"
@@ -185,6 +187,7 @@ class MainWindow(QMainWindow):
         self.dataframe: Optional[pd.DataFrame] = None
         self.time_col: Optional[str] = None
         self.numeric_cols: list[str] = []
+        self.daily_metric_groups: dict[str, dict[str, str]] = {}
 
         self._build_ui()
         self.refresh_settings_display()
@@ -360,14 +363,12 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "CSV error", f"Failed to read CSV:\n{exc}")
             return
 
-        time_col = self.detect_time_column(df)
-        if not time_col:
+        try:
+            df, time_col = prepare_daily_dataframe(df)
+        except ValueError:
             self.log_status("No timestamp/date column detected.")
             QMessageBox.warning(self, "CSV error", "Could not detect a timestamp/date column.")
             return
-
-        df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
-        df = df.dropna(subset=[time_col]).sort_values(time_col)
 
         numeric_cols = []
         for col in df.columns:
@@ -381,9 +382,13 @@ class MainWindow(QMainWindow):
         self.dataframe = df
         self.time_col = time_col
         self.numeric_cols = numeric_cols
+        self.daily_metric_groups = extract_daily_stat_groups(df.columns)
         self.rows_label.setText(f"{len(df):,} rows, timestamp column: {time_col}")
         self.populate_metric_list()
-        self.log_status(f"Loaded CSV: {len(df):,} rows; {len(numeric_cols)} numeric metrics found.")
+        self.log_status(
+            f"Loaded CSV: {len(df):,} rows; {len(numeric_cols)} numeric metrics found; "
+            f"{len(self.daily_metric_groups)} daily metric groups detected."
+        )
 
     def detect_time_column(self, df: pd.DataFrame) -> Optional[str]:
         candidates = ["last_changed", "last_updated", "time", "timestamp", "date", "datetime"]
