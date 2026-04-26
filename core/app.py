@@ -10,6 +10,7 @@ import pandas as pd
 
 from PySide6.QtCore import QDate, Qt
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QComboBox,
     QDateEdit,
@@ -27,6 +28,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QScrollArea,
     QPushButton,
     QSizePolicy,
     QTextEdit,
@@ -37,26 +39,49 @@ from PySide6.QtWidgets import (
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
+from core.daily_metrics import (
+    METRIC_PRESET_LABELS,
+    TEMPERATURE_LOWER_PRESET_LABEL,
+    build_metric_presets,
+)
 from core.services.config_store import APP_NAME, APP_ORG, AppConfig, ConfigStore
 from core.services.greenhouse_service import (
     capture_csv as capture_greenhouse_csv,
+    describe_capture_failure,
     filter_dataframe as filter_greenhouse_dataframe,
     load_csv as load_greenhouse_csv,
 )
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, parent: QWidget | None, config: AppConfig) -> None:
+    def __init__(self, parent: QWidget | None, config: AppConfig, config_store: ConfigStore) -> None:
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.setMinimumWidth(650)
+        self.config_store = config_store
 
+        self.username_edit = QLineEdit(config.device_username)
         self.device_edit = QLineEdit(config.device_address)
         self.remote_csv_edit = QLineEdit(config.remote_csv_path)
         self.output_dir_edit = QLineEdit(config.output_dir)
+        self.password_edit = QLineEdit(config.device_password)
+        self.last_browse_dir = self.config_store.load_last_browse_dir()
+        self.password_visible = False
 
+        for widget in (self.username_edit, self.device_edit, self.remote_csv_edit, self.output_dir_edit):
+            widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        self.password_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.password_edit.setEchoMode(QLineEdit.Password)
+
+        self.password_toggle_button = QPushButton("Show")
+        self.password_toggle_button.clicked.connect(self.toggle_password_visibility)
         browse_button = QPushButton("Browse...")
         browse_button.clicked.connect(self.browse_output_dir)
+
+        password_row = QHBoxLayout()
+        password_row.addWidget(self.password_edit, 1)
+        password_row.addWidget(self.password_toggle_button)
 
         output_row = QHBoxLayout()
         output_row.addWidget(self.output_dir_edit, 1)
@@ -65,13 +90,17 @@ class SettingsDialog(QDialog):
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignLeft)
         form.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
-        form.addRow("Pi SSH address:", self.device_edit)
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        form.addRow("Pi username:", self.username_edit)
+        form.addRow("Pi host / address:", self.device_edit)
+        form.addRow("Pi password:", password_row)
         form.addRow("Remote CSV path:", self.remote_csv_edit)
         form.addRow("Local output directory:", output_row)
 
         help_label = QLabel(
             "Example remote CSV path: /home/mtgardn/greenhouse_logs/greenhouse_daily_log.csv\n"
-            "The Capture button will run: scp <Pi SSH address>:<Remote CSV path> <Local output directory>/"
+            "The Capture button will run: scp <Pi username>@<Pi host>:<Remote CSV path> <Local output directory>/\n"
+            "If a password is entered, sshpass must be installed for non-interactive capture."
         )
         help_label.setWordWrap(True)
         help_label.setStyleSheet("color: #555;")
@@ -87,14 +116,23 @@ class SettingsDialog(QDialog):
         layout.addWidget(buttons)
 
     def browse_output_dir(self) -> None:
-        current = self.output_dir_edit.text().strip() or str(Path.home())
+        current = self.output_dir_edit.text().strip() or self.last_browse_dir or str(Path.home())
         directory = QFileDialog.getExistingDirectory(self, "Select output directory", current)
         if directory:
             self.output_dir_edit.setText(directory)
+            self.last_browse_dir = directory
+            self.config_store.save_last_browse_dir(directory)
+
+    def toggle_password_visibility(self) -> None:
+        self.password_visible = not self.password_visible
+        self.password_edit.setEchoMode(QLineEdit.Normal if self.password_visible else QLineEdit.Password)
+        self.password_toggle_button.setText("Hide" if self.password_visible else "Show")
 
     def config(self) -> AppConfig:
         return AppConfig(
+            device_username=self.username_edit.text().strip(),
             device_address=self.device_edit.text().strip(),
+            device_password=self.password_edit.text(),
             remote_csv_path=self.remote_csv_edit.text().strip(),
             output_dir=self.output_dir_edit.text().strip(),
         )
@@ -126,6 +164,32 @@ class PlotCanvas(FigureCanvas):
         self.draw_idle()
 
 
+class GraphDialog(QDialog):
+    def __init__(self, parent: QWidget | None, df: pd.DataFrame, time_col: str, metric_cols: list[str], title: str) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Graph")
+        self.setMinimumSize(1400, 900)
+        self.resize(1600, 1000)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        summary = QLabel(f"Metrics: {', '.join(metric_cols)}")
+        summary.setWordWrap(True)
+        summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
+        self.plot_canvas = PlotCanvas()
+        self.plot_canvas.plot_metrics(df=df, time_col=time_col, metric_cols=metric_cols, title=title)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+
+        layout.addWidget(summary)
+        layout.addWidget(self.plot_canvas, stretch=1)
+        layout.addWidget(buttons)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -138,6 +202,7 @@ class MainWindow(QMainWindow):
         self.time_col: Optional[str] = None
         self.numeric_cols: list[str] = []
         self.daily_metric_groups: dict[str, dict[str, str]] = {}
+        self.metric_presets: dict[str, list[str]] = {label: [] for label in METRIC_PRESET_LABELS}
 
         self._build_ui()
         self.refresh_settings_display()
@@ -149,15 +214,12 @@ class MainWindow(QMainWindow):
 
         main_layout = QVBoxLayout(root)
         main_layout.setContentsMargins(12, 12, 12, 12)
-        main_layout.setSpacing(10)
+        main_layout.setSpacing(8)
         main_layout.setAlignment(Qt.AlignLeft | Qt.AlignTop)
 
         main_layout.addWidget(self._build_header())
-        main_layout.addWidget(self._build_status_frame())
+        main_layout.addWidget(self._build_status_scroll_area())
         main_layout.addWidget(self._build_controls_frame())
-
-        self.plot_canvas = PlotCanvas()
-        main_layout.addWidget(self.plot_canvas, stretch=1)
 
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
@@ -193,16 +255,16 @@ class MainWindow(QMainWindow):
         exit_button.clicked.connect(self.close)
 
         header_layout.addWidget(title)
+        header_layout.addStretch(1)
         header_layout.addWidget(settings_button)
         header_layout.addWidget(capture_button)
         header_layout.addWidget(graph_button)
         header_layout.addWidget(exit_button)
-        header_layout.addStretch(1)
         return header
 
     def _build_status_frame(self) -> QGroupBox:
         self.status_frame = QGroupBox("Status / Configuration")
-        self.status_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.status_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
         status_layout = QGridLayout(self.status_frame)
         status_layout.setContentsMargins(12, 12, 12, 12)
@@ -211,37 +273,53 @@ class MainWindow(QMainWindow):
         status_layout.setAlignment(Qt.AlignLeft | Qt.AlignTop)
 
         self.device_label = QLabel()
+        self.username_label = QLabel()
         self.remote_file_label = QLabel()
         self.output_dir_label = QLabel()
         self.local_file_label = QLabel()
         self.rows_label = QLabel("No data loaded")
 
-        for label in (self.device_label, self.remote_file_label, self.output_dir_label, self.local_file_label, self.rows_label):
+        for label in (self.username_label, self.device_label, self.remote_file_label, self.output_dir_label, self.local_file_label, self.rows_label):
             label.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
-        status_layout.addWidget(QLabel("Pi address:"), 0, 0)
-        status_layout.addWidget(self.device_label, 0, 1)
-        status_layout.addWidget(QLabel("Remote CSV:"), 1, 0)
-        status_layout.addWidget(self.remote_file_label, 1, 1)
-        status_layout.addWidget(QLabel("Output directory:"), 2, 0)
-        status_layout.addWidget(self.output_dir_label, 2, 1)
-        status_layout.addWidget(QLabel("Local CSV:"), 3, 0)
-        status_layout.addWidget(self.local_file_label, 3, 1)
-        status_layout.addWidget(QLabel("Loaded data:"), 4, 0)
-        status_layout.addWidget(self.rows_label, 4, 1)
+        status_layout.addWidget(QLabel("Pi username:"), 0, 0)
+        status_layout.addWidget(self.username_label, 0, 1)
+        status_layout.addWidget(QLabel("Pi address:"), 1, 0)
+        status_layout.addWidget(self.device_label, 1, 1)
+        status_layout.addWidget(QLabel("Remote CSV:"), 2, 0)
+        status_layout.addWidget(self.remote_file_label, 2, 1)
+        status_layout.addWidget(QLabel("Output directory:"), 3, 0)
+        status_layout.addWidget(self.output_dir_label, 3, 1)
+        status_layout.addWidget(QLabel("Local CSV:"), 4, 0)
+        status_layout.addWidget(self.local_file_label, 4, 1)
+        status_layout.addWidget(QLabel("Loaded data:"), 5, 0)
+        status_layout.addWidget(self.rows_label, 5, 1)
 
         status_layout.setColumnStretch(1, 1)
         return self.status_frame
+
+    def _build_status_scroll_area(self) -> QScrollArea:
+        status_scroll_area = QScrollArea()
+        status_scroll_area.setWidgetResizable(True)
+        status_scroll_area.setFrameShape(QFrame.NoFrame)
+        status_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        status_scroll_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        status_scroll_area.setMinimumHeight(160)
+        status_scroll_area.setWidget(self._build_status_frame())
+        return status_scroll_area
 
     def _build_controls_frame(self) -> QGroupBox:
         controls = QGroupBox("Graph Options")
         controls.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        controls_layout = QGridLayout(controls)
+        controls_layout = QVBoxLayout(controls)
         controls_layout.setContentsMargins(12, 12, 12, 12)
-        controls_layout.setHorizontalSpacing(12)
-        controls_layout.setVerticalSpacing(8)
+        controls_layout.setSpacing(10)
         controls_layout.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+
+        date_row = QHBoxLayout()
+        date_row.setSpacing(12)
+        date_row.setAlignment(Qt.AlignLeft | Qt.AlignTop)
 
         self.range_combo = QComboBox()
         self.range_combo.addItems(["Last 30 days", "Last 3 months", "Year to date", "Specified year", "Custom range", "All data"])
@@ -249,35 +327,62 @@ class MainWindow(QMainWindow):
 
         self.year_edit = QLineEdit(str(date.today().year))
         self.year_edit.setMaximumWidth(100)
+        self.year_edit.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
         self.start_date_edit = QDateEdit()
         self.start_date_edit.setCalendarPopup(True)
         self.start_date_edit.setDate(QDate(date.today().year, 1, 1))
+        self.start_date_edit.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
         self.end_date_edit = QDateEdit()
         self.end_date_edit.setCalendarPopup(True)
         self.end_date_edit.setDate(QDate.currentDate())
+        self.end_date_edit.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
         self.metric_list = QListWidget()
-        self.metric_list.setSelectionMode(QListWidget.MultiSelection)
-        self.metric_list.setMinimumHeight(90)
+        self.metric_list.setSelectionMode(QAbstractItemView.MultiSelection)
+        self.metric_list.setMinimumHeight(240)
+        self.metric_list.setMaximumHeight(280)
+        self.metric_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        controls_layout.addWidget(QLabel("Date window:"), 0, 0)
-        controls_layout.addWidget(self.range_combo, 0, 1)
-        controls_layout.addWidget(QLabel("Year:"), 0, 2)
-        controls_layout.addWidget(self.year_edit, 0, 3)
-        controls_layout.addWidget(QLabel("Start:"), 1, 0)
-        controls_layout.addWidget(self.start_date_edit, 1, 1)
-        controls_layout.addWidget(QLabel("End:"), 1, 2)
-        controls_layout.addWidget(self.end_date_edit, 1, 3)
-        controls_layout.addWidget(QLabel("Metrics:"), 2, 0)
-        controls_layout.addWidget(self.metric_list, 2, 1, 1, 3)
+        self.metric_preset_combo = QComboBox()
+        self.metric_preset_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.metric_preset_combo.addItems(METRIC_PRESET_LABELS)
 
-        controls_layout.setColumnStretch(1, 1)
-        controls_layout.setColumnStretch(3, 0)
+        self.metric_preset_button = QPushButton("Apply Preset")
+        self.metric_preset_button.clicked.connect(self.apply_selected_metric_preset)
+
+        self.clear_preset_button = QPushButton("Clear Preset")
+        self.clear_preset_button.clicked.connect(self.clear_metric_selection)
+
+        date_row.addWidget(QLabel("Date window:"))
+        date_row.addWidget(self.range_combo)
+        date_row.addWidget(QLabel("Year:"))
+        date_row.addWidget(self.year_edit)
+        date_row.addWidget(QLabel("Start:"))
+        date_row.addWidget(self.start_date_edit)
+        date_row.addWidget(QLabel("End:"))
+        date_row.addWidget(self.end_date_edit)
+        date_row.addStretch(1)
+
+        preset_row = QHBoxLayout()
+        preset_row.setSpacing(12)
+        preset_row.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        preset_row.addWidget(QLabel("Metric set:"))
+        preset_row.addWidget(self.metric_preset_combo, 1)
+        preset_row.addWidget(self.metric_preset_button)
+        preset_row.addWidget(self.clear_preset_button)
+        preset_row.addStretch(1)
+
+        controls_layout.addLayout(date_row)
+        controls_layout.addLayout(preset_row)
+        controls_layout.addWidget(QLabel("Metrics:"))
+        controls_layout.addWidget(self.metric_list)
+
         return controls
 
     def refresh_settings_display(self) -> None:
+        self.username_label.setText(self.config.device_username or "Not set")
         self.device_label.setText(self.config.device_address or "Not set")
         self.remote_file_label.setText(self.config.remote_csv_path or "Not set")
         self.output_dir_label.setText(self.config.output_dir or "Not set")
@@ -288,11 +393,11 @@ class MainWindow(QMainWindow):
         self.log_box.append(f"[{stamp}] {message}")
 
     def open_settings(self) -> None:
-        dialog = SettingsDialog(self, self.config)
+        dialog = SettingsDialog(self, self.config, self.config_store)
         if dialog.exec() == QDialog.Accepted:
             new_config = dialog.config()
-            if not new_config.device_address or not new_config.remote_csv_path or not new_config.output_dir:
-                QMessageBox.warning(self, "Missing settings", "Pi address, remote CSV path, and output directory are required.")
+            if not new_config.device_username or not new_config.device_address or not new_config.remote_csv_path or not new_config.output_dir:
+                QMessageBox.warning(self, "Missing settings", "Pi username, host/address, remote CSV path, and output directory are required.")
                 return
 
             self.config = new_config
@@ -301,8 +406,13 @@ class MainWindow(QMainWindow):
             self.log_status("Settings saved.")
 
     def capture_csv(self) -> None:
-        if not self.config.device_address or not self.config.remote_csv_path or not self.config.output_dir:
-            QMessageBox.warning(self, "Missing settings", "Open Settings and fill in the Pi address, remote CSV path, and output directory.")
+        if (
+            not self.config.device_username
+            or not self.config.device_address
+            or not self.config.remote_csv_path
+            or not self.config.output_dir
+        ):
+            QMessageBox.warning(self, "Missing settings", "Open Settings and fill in the Pi username, host/address, remote CSV path, and output directory.")
             return
 
         self.log_status(f"Capturing CSV from {self.config.device_address}:{self.config.remote_csv_path}")
@@ -317,9 +427,13 @@ class MainWindow(QMainWindow):
             self.log_status("Capture failed: scp command not found.")
             QMessageBox.critical(self, "Capture failed", "scp command not found on this Mac.")
             return
+        except RuntimeError as exc:
+            self.log_status(f"Capture failed: {exc}")
+            QMessageBox.critical(self, "Capture failed", str(exc))
+            return
 
         if result.returncode != 0:
-            error_text = result.stderr.strip() or result.stdout.strip() or "Unknown scp error"
+            error_text = describe_capture_failure(result.stderr, result.stdout)
             self.log_status(f"Capture failed: {error_text}")
             QMessageBox.critical(self, "Capture failed", error_text)
             return
@@ -345,6 +459,8 @@ class MainWindow(QMainWindow):
         self.daily_metric_groups = result.daily_metric_groups
         self.rows_label.setText(f"{len(result.dataframe):,} rows, timestamp column: {result.time_col}")
         self.populate_metric_list()
+        self.refresh_metric_presets()
+        self.apply_default_metric_preset()
         self.log_status(
             f"Loaded CSV: {len(result.dataframe):,} rows; {len(result.numeric_cols)} numeric metrics found; "
             f"{len(result.daily_metric_groups)} daily metric groups detected."
@@ -352,16 +468,62 @@ class MainWindow(QMainWindow):
 
     def populate_metric_list(self) -> None:
         self.metric_list.clear()
-        preferred = ["temp", "temperature", "humid", "humidity"]
 
         for col in self.numeric_cols:
             item = QListWidgetItem(col)
-            if any(token in col.lower() for token in preferred):
-                item.setSelected(True)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Unchecked)
             self.metric_list.addItem(item)
 
     def selected_metrics(self) -> list[str]:
-        return [item.text() for item in self.metric_list.selectedItems()]
+        selected: list[str] = []
+        seen: set[str] = set()
+
+        for item in self.metric_list.selectedItems():
+            if item.text() not in seen:
+                selected.append(item.text())
+                seen.add(item.text())
+
+        for index in range(self.metric_list.count()):
+            item = self.metric_list.item(index)
+            if item.checkState() == Qt.Checked and item.text() not in seen:
+                selected.append(item.text())
+                seen.add(item.text())
+
+        return selected
+
+    def refresh_metric_presets(self) -> None:
+        current_label = self.metric_preset_combo.currentText()
+        self.metric_presets = build_metric_presets(self.numeric_cols, self.daily_metric_groups)
+
+        self.metric_preset_combo.blockSignals(True)
+        self.metric_preset_combo.clear()
+        for label in METRIC_PRESET_LABELS:
+            self.metric_preset_combo.addItem(label)
+        self.metric_preset_combo.setCurrentText(current_label if current_label in self.metric_presets else TEMPERATURE_LOWER_PRESET_LABEL)
+        self.metric_preset_combo.blockSignals(False)
+
+    def apply_selected_metric_preset(self) -> None:
+        self.apply_metric_preset(self.metric_preset_combo.currentText())
+
+    def apply_default_metric_preset(self) -> None:
+        self.metric_preset_combo.setCurrentText(TEMPERATURE_LOWER_PRESET_LABEL)
+        self.apply_metric_preset(TEMPERATURE_LOWER_PRESET_LABEL)
+
+    def apply_metric_preset(self, label: str) -> None:
+        metric_names = self.metric_presets.get(label, [])
+        selected = set(metric_names)
+        self.metric_list.clearSelection()
+        for index in range(self.metric_list.count()):
+            item = self.metric_list.item(index)
+            item.setCheckState(Qt.Checked if item.text() in selected else Qt.Unchecked)
+            item.setSelected(item.text() in selected)
+
+    def clear_metric_selection(self) -> None:
+        self.metric_list.clearSelection()
+        for index in range(self.metric_list.count()):
+            item = self.metric_list.item(index)
+            item.setCheckState(Qt.Unchecked)
 
     def on_range_changed(self, text: str) -> None:
         year_mode = text == "Specified year"
@@ -371,9 +533,6 @@ class MainWindow(QMainWindow):
         self.end_date_edit.setEnabled(custom_mode)
 
     def filtered_dataframe(self) -> Optional[pd.DataFrame]:
-        if self.dataframe is None or self.time_col is None:
-            self.load_csv(self.config.local_csv_path)
-
         if self.dataframe is None or self.time_col is None:
             return None
 
@@ -396,6 +555,8 @@ class MainWindow(QMainWindow):
     def generate_graph(self) -> None:
         df = self.filtered_dataframe()
         if df is None:
+            QMessageBox.warning(self, "No data", "Load a CSV before graphing metrics.")
+            self.log_status("Graph requested but no CSV data is loaded.")
             return
 
         metrics = self.selected_metrics()
@@ -407,13 +568,17 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No data", "No rows match the selected date window.")
             return
 
-        self.plot_canvas.plot_metrics(
+        dialog = GraphDialog(
+            self,
             df=df,
             time_col=self.time_col,
             metric_cols=metrics,
             title=f"Greenhouse Metrics - {self.range_combo.currentText()}",
         )
+        self._graph_dialog = dialog
+        dialog.exec()
         self.log_status(f"Graph generated for {len(df):,} rows and metrics: {', '.join(metrics)}")
+        self.clear_metric_selection()
 
     @staticmethod
     def _qdate_to_date(value: QDate) -> date:
