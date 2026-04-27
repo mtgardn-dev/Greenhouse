@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
+from core.build_info import APP_DISPLAY_NAME, BuildInfo, format_build_info_lines, load_build_info
 from core.daily_metrics import (
     METRIC_PRESET_LABELS,
     TEMPERATURE_LOWER_PRESET_LABEL,
@@ -190,6 +191,32 @@ class GraphDialog(QDialog):
         layout.addWidget(buttons)
 
 
+class AboutDialog(QDialog):
+    def __init__(self, parent: QWidget | None, build_info: BuildInfo) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"About {APP_DISPLAY_NAME}")
+        self.setMinimumWidth(520)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        title = QLabel(APP_DISPLAY_NAME)
+        title.setStyleSheet("font-size: 20px; font-weight: bold;")
+
+        info_box = QTextEdit()
+        info_box.setReadOnly(True)
+        info_box.setMinimumHeight(180)
+        info_box.setPlainText("\n".join(format_build_info_lines(build_info)))
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+
+        layout.addWidget(title)
+        layout.addWidget(info_box)
+        layout.addWidget(buttons)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -203,6 +230,7 @@ class MainWindow(QMainWindow):
         self.numeric_cols: list[str] = []
         self.daily_metric_groups: dict[str, dict[str, str]] = {}
         self.metric_presets: dict[str, list[str]] = {label: [] for label in METRIC_PRESET_LABELS}
+        self.build_info = load_build_info()
 
         self._build_ui()
         self.refresh_settings_display()
@@ -251,6 +279,9 @@ class MainWindow(QMainWindow):
         graph_button = QPushButton("Graph")
         graph_button.clicked.connect(self.generate_graph)
 
+        about_button = QPushButton("About")
+        about_button.clicked.connect(self.open_about)
+
         exit_button = QPushButton("Exit")
         exit_button.clicked.connect(self.close)
 
@@ -259,6 +290,7 @@ class MainWindow(QMainWindow):
         header_layout.addWidget(settings_button)
         header_layout.addWidget(capture_button)
         header_layout.addWidget(graph_button)
+        header_layout.addWidget(about_button)
         header_layout.addWidget(exit_button)
         return header
 
@@ -404,6 +436,9 @@ class MainWindow(QMainWindow):
             self.config_store.save(self.config)
             self.refresh_settings_display()
             self.log_status("Settings saved.")
+
+    def open_about(self) -> None:
+        AboutDialog(self, self.build_info).exec()
 
     def capture_csv(self) -> None:
         if (
